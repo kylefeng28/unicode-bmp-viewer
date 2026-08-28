@@ -48,6 +48,47 @@
     backdrop-filter: blur(8px);
     z-index: 100;
   }
+
+  /* Color legend */
+  #legend {
+    position: fixed;
+    bottom: 12px;
+    left: 12px;
+    background: rgba(20, 20, 40, 0.9);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 11px;
+    backdrop-filter: blur(8px);
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+    pointer-events: auto;
+  }
+  #legend h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+    margin-bottom: 8px;
+  }
+  #legend .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+    cursor: default;
+  }
+  #legend .legend-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  #legend .legend-label {
+    color: #ccc;
+    white-space: nowrap;
+  }
+
   /* Instructions */
   #help {
     position: fixed;
@@ -72,8 +113,11 @@
 <div id="info">
   <div><span class="label">Zoom: </span><span class="value" id="zoom-level">1.0x</span></div>
   <div><span class="label">View: </span><span class="value" id="view-mode">Block Overview</span></div>
+  <div><span class="label">Category: </span><span class="value" id="hover-category">—</span></div>
   <div><span class="label">Block: </span><span class="value" id="hover-block">—</span></div>
 </div>
+
+<div id="legend"></div>
 
 <div id="help">
   Scroll to zoom · Drag to pan · Hover for details
@@ -166,9 +210,8 @@ const GRID_ROWS = 256;
 const CELL_SIZE = 4; // base cell size in "world" pixels
 
 // Zoom min thresholds
-const LEVEL_BLOCK_LABELS = 1.5;
-const LEVEL_BLOCK = 3;
-const LEVEL_CHARACTER_GRID = 4;
+const LEVEL_BLOCK_LABELS = 3;
+const LEVEL_CHARACTER_GRID = 5;
 const LEVEL_CHARACTER = 14;
 
 let width, height;
@@ -194,11 +237,53 @@ for (let i = 0; i < BLOCKS.length; i++) {
   blockIndex.fill(i, start, end)
 }
 
-// Precompute block color index
-const blockColors = BLOCKS.map(([, , name]) => {
-  const cat = getBlockCategory(name);
-  return CATEGORY_COLORS[cat] || CATEGORY_COLORS["Other"];
-});
+// Precompute block colors and category names
+const blockCategories = BLOCKS.map(([, , name]) => getBlockCategory(name));
+const blockColors = blockCategories.map(cat =>
+  CATEGORY_COLORS[cat] || CATEGORY_COLORS["Other"]
+);
+
+// Build the color legend in the DOM
+(function buildLegend() {
+  const legendEl = document.getElementById("legend");
+  let html = '<h3>Categories</h3>';
+  for (const [cat, color] of Object.entries(CATEGORY_COLORS)) {
+    if (!color) continue;
+    html += `<div class="legend-item">
+      <div class="legend-swatch" style="background:${color}"></div>
+      <span class="legend-label">${cat}</span>
+    </div>`;
+  }
+  legendEl.innerHTML = html;
+})();
+
+// Precompute category regions for drawing big category labels when zoomed out.
+// Group contiguous blocks of the same category and compute their bounding box.
+const categoryRegions = [];
+(function computeCategoryRegions() {
+  let currentCat = null;
+  let regionStart = 0;
+  for (let i = 0; i <= BLOCKS.length; i++) {
+    const cat = i < BLOCKS.length ? blockCategories[i] : null;
+    if (cat !== currentCat) {
+      if (currentCat !== null) {
+        // Close previous region
+        const startCp = BLOCKS[regionStart][0];
+        const endCp = BLOCKS[i - 1][1];
+        categoryRegions.push({
+          category: currentCat,
+          startCp,
+          endCp,
+          startRow: Math.floor(startCp / GRID_COLS),
+          endRow: Math.floor(endCp / GRID_COLS),
+          color: CATEGORY_COLORS[currentCat] || CATEGORY_COLORS["Other"]
+        });
+      }
+      currentCat = cat;
+      regionStart = i;
+    }
+  }
+})();
 
 // Darken a hex color
 function darken(hex, amount) {
@@ -253,7 +338,7 @@ function render() {
 
   if (cellScreen >= LEVEL_CHARACTER ) {
     viewEl.textContent = "Character View";
-  } else if (cellScreen >= LEVEL_BLOCK) {
+  } else if (cellScreen >= LEVEL_BLOCK_LABELS) {
     viewEl.textContent = "Block Details";
   } else {
     viewEl.textContent = "Block Overview";
@@ -304,6 +389,39 @@ function render() {
     }
   }
   renderBlocks();
+
+  function renderCategoryLabels() {
+    for (const region of categoryRegions) {
+      const { category, startRow, endRow, color } = region;
+      const regionHeight = (endRow - startRow + 1) * CELL_SIZE * k;
+      if (regionHeight < 12) continue;
+
+      const ry = calcy(startRow);
+      if (ry > height || ry + regionHeight < 0) continue;
+
+      const midY = calcy((startRow + endRow) / 2);
+      const midX = calcx(128);
+
+      const fontSize = Math.min(Math.max(regionHeight * 0.4, 10) * k, 28);
+      ctx.font = `bold ${fontSize}px ${FONT}`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      const metrics = ctx.measureText(category);
+      const pad = 4;
+      ctx.fillStyle = "rgba(10,10,30,0.6)";
+      ctx.fillRect(midX - metrics.width / 2 - pad, midY - fontSize / 2 - pad,
+                   metrics.width + pad * 2, fontSize + pad * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.95;
+      ctx.fillText(category, midX, midY);
+      ctx.globalAlpha = 1.0;
+    }
+  }
+
+  if (cellScreen < LEVEL_CHARACTER) {
+    renderCategoryLabels();
+  }
 
   // --- LEVEL 2: Render block borders and labels (when zoomed enough to see them) ---
   function renderBlockOutline(renderLabel) {
@@ -481,13 +599,16 @@ function updateHover(px, py) {
   if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) {
     document.getElementById("tooltip").style.display = "none";
     document.getElementById("hover-block").textContent = "—";
+    document.getElementById("hover-category").textContent = "—";
     return;
   }
 
   const cp = row * GRID_COLS + col;
   const bi = blockIndex[cp];
   const blockName = bi < 255 ? BLOCKS[bi][2] : "No Block";
+  const category = bi < 255 ? blockCategories[bi] : "—";
   document.getElementById("hover-block").textContent = blockName;
+  document.getElementById("hover-category").textContent = category;
 
   updateTooltip(px, py, cp, blockName);
 }
