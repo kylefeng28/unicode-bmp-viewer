@@ -35,6 +35,19 @@
   }
   #info .label { color: #888; }
   #info .value { color: #fff; font-weight: 500; }
+  /* Hover tooltip */
+  #tooltip {
+    position: fixed;
+    background: rgba(20, 20, 40, 0.95);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+    backdrop-filter: blur(8px);
+    z-index: 100;
+  }
   /* Instructions */
   #help {
     position: fixed;
@@ -53,6 +66,8 @@
 <body>
 
 <canvas id="canvas"></canvas>
+
+<div id="tooltip"></div>
 
 <div id="info">
   <div><span class="label">Zoom: </span><span class="value" id="zoom-level">1.0x</span></div>
@@ -153,7 +168,8 @@ const CELL_SIZE = 4; // base cell size in "world" pixels
 // Zoom min thresholds
 const LEVEL_BLOCK_LABELS = 1.5;
 const LEVEL_BLOCK = 3;
-const LEVEL_CHARACTER_GRID = 6;
+const LEVEL_CHARACTER_GRID = 4;
+const LEVEL_CHARACTER = 14;
 
 let width, height;
 let transform = d3.zoomIdentity;
@@ -235,7 +251,9 @@ function render() {
   const viewEl = document.getElementById("view-mode");
   zoomEl.textContent = k.toFixed(1) + "x";
 
-  if (cellScreen >= LEVEL_BLOCK) {
+  if (cellScreen >= LEVEL_CHARACTER ) {
+    viewEl.textContent = "Character View";
+  } else if (cellScreen >= LEVEL_BLOCK) {
     viewEl.textContent = "Block Details";
   } else {
     viewEl.textContent = "Block Overview";
@@ -366,6 +384,55 @@ function render() {
     renderCharGrid();
   }
 
+  // --- Draw individual characters when zoomed in enough ---
+  function renderCharacters() {
+    const charSize = Math.min(cellScreen * 0.65, 40);
+    ctx.font = `${charSize}px ${FONT}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff";
+
+    // Limit how many chars we render for performance
+    const maxChars = 10000;
+    let charCount = 0;
+
+    for (let row = rowStart; row <= rowEnd && charCount < maxChars; row++) {
+      for (let col = colStart; col <= colEnd && charCount < maxChars; col++) {
+        const cp = row * GRID_COLS + col;
+        if (cp > 0xFFFF) continue;
+
+        // Skip control characters, surrogates, private use at very high density
+        const bi = blockIndex[cp];
+        if (bi === 255) continue;
+        const blockName = BLOCKS[bi][2];
+        if (blockName.includes("Surrogate")) continue;
+
+        // Skip C0/C1 control characters
+        if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) continue;
+
+        const cx = calcx(col + 0.5);
+        const cy = calcy(row + 0.5);
+
+        // Only render if on screen
+        if (cx < -cellScreen || cx > width + cellScreen || cy < -cellScreen || cy > height + cellScreen) continue;
+
+        try {
+          const char = String.fromCodePoint(cp);
+          ctx.fillStyle = hexToRgba(blockColors[bi], 0.9);
+          ctx.fillText(char, cx, cy);
+        } catch(e) {
+          // Skip invalid codepoints
+          console.log(`Invalid codepoint: ${cp}`, e)
+        }
+        charCount++;
+      }
+    }
+  }
+
+  if (cellScreen >= LEVEL_CHARACTER) {
+    renderCharacters();
+  }
+
   // --- Draw hex row/col indicators ---
   function renderHexRowColIndicators() {
     const indicatorSize = Math.max(8, Math.min(11, cellScreen * 0.5));
@@ -400,6 +467,7 @@ canvas.addEventListener("mousemove", (e) => {
 });
 
 canvas.addEventListener("mouseleave", () => {
+  document.getElementById("tooltip").style.display = "none";
   document.getElementById("hover-block").textContent = "—";
 });
 
@@ -411,6 +479,7 @@ function updateHover(px, py) {
   const row = Math.floor(worldY / CELL_SIZE);
 
   if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) {
+    document.getElementById("tooltip").style.display = "none";
     document.getElementById("hover-block").textContent = "—";
     return;
   }
@@ -419,12 +488,56 @@ function updateHover(px, py) {
   const bi = blockIndex[cp];
   const blockName = bi < 255 ? BLOCKS[bi][2] : "No Block";
   document.getElementById("hover-block").textContent = blockName;
+
+  updateTooltip(px, py, cp, blockName);
+}
+
+function updateTooltip(px, py, cp, blockName) {
+  const tooltip = document.getElementById("tooltip");
+
+  // Show tooltip with character info when zoomed in enough
+  const cellScreen = CELL_SIZE * transform.k;
+  if (cellScreen < LEVEL_CHARACTER_GRID) {
+    tooltip.style.display = "none";
+    return;
+  }
+
+  const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+  let char = "";
+  try { char = String.fromCodePoint(cp); } catch(e) {}
+
+  const isSurrogate = (cp >= 0xD800 && cp <= 0xDFFF);
+  const isControl = cp < 0x20 || (cp >= 0x7F && cp <= 0x9F);
+
+  let display = "";
+  if (isSurrogate) {
+    display = `<span style="color:#888">U+${hex}</span> — ${blockName}<br><span style="color:#666">(Surrogate, not a character)</span>`;
+  } else if (isControl) {
+    display = `<span style="color:#888">U+${hex}</span> — ${blockName}<br><span style="color:#666">(Control character)</span>`;
+  } else {
+    display = `<span class="char">${char}</span> <span style="color:#888">U+${hex}</span><br>${blockName}`;
+  }
+
+  tooltip.innerHTML = display;
+  tooltip.style.display = "block";
+  tooltip.style.left = (px + 16) + "px";
+  tooltip.style.top = (py - 10) + "px";
+
+  // Keep tooltip on screen
+  const rect = tooltip.getBoundingClientRect();
+  if (rect.right > width) {
+    tooltip.style.left = (px - rect.width - 10) + "px";
+  }
+  if (rect.bottom > height) {
+    tooltip.style.top = (py - rect.height - 10) + "px";
+  }
 }
 
 // =============================================================================
 // D3 Zoom setup
 // =============================================================================
 const zoom = d3.zoom()
+  .scaleExtent([null, 300])  // from zoomed out to see individual chars
   .on("zoom", (event) => {
     transform = event.transform;
     render();
