@@ -13,11 +13,23 @@
     overflow: hidden;
     height: 100vh;
   }
-  #canvas {
+  #canvas, #char-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
     display: block;
+  }
+  #canvas {
     cursor: grab;
   }
   #canvas:active { cursor: grabbing; }
+  /* The character cache canvas sits on top of the main canvas and only ever
+     draws unicode glyphs, composited from cached per-tile bitmaps. It never
+     receives pointer events itself -- all panning/zooming/hover happens on
+     the main canvas underneath. */
+  #char-canvas {
+    pointer-events: none;
+  }
   /* Info panel in top-left corner */
   #info {
     position: fixed;
@@ -107,6 +119,7 @@
 <body>
 
 <canvas id="canvas"></canvas>
+<canvas id="char-canvas"></canvas>
 
 <div id="tooltip"></div>
 
@@ -203,6 +216,13 @@ function getBlockCategory(name) {
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 
+// Overlay canvas dedicated to rendering unicode glyphs from the tile cache.
+// Kept separate from the main canvas so glyph rendering (relatively expensive,
+// and the thing we want to cache/upgrade progressively) never has to be
+// redone just because the background/borders/labels need a redraw.
+const charCanvas = document.getElementById("char-canvas");
+const cctx = charCanvas.getContext("2d");
+
 const FONT = "-apple-system, BlinkMacSystemFont, 'Noto Sans', sans-serif";
 
 // Grid dimensions: 256 columns × 256 rows = 65536 codepoints (the full BMP)
@@ -213,7 +233,7 @@ const CELL_SIZE = 4; // base cell size in "world" pixels
 // Zoom min thresholds
 const LEVEL_BLOCK_LABELS = 3;
 const LEVEL_CHARACTER_GRID = 5;
-const LEVEL_CHARACTER = 14;
+const LEVEL_CHARACTER = 6;
 
 let width, height;
 let transform = d3.zoomIdentity;
@@ -222,11 +242,19 @@ let transform = d3.zoomIdentity;
 function resize() {
   width = window.innerWidth;
   height = window.innerHeight;
+
   canvas.width = width * devicePixelRatio;
   canvas.height = height * devicePixelRatio;
   canvas.style.width = width + "px";
   canvas.style.height = height + "px";
   ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
+  charCanvas.width = width * devicePixelRatio;
+  charCanvas.height = height * devicePixelRatio;
+  charCanvas.style.width = width + "px";
+  charCanvas.style.height = height + "px";
+  cctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
   render();
 }
 
@@ -305,6 +333,213 @@ function hexToRgba(hex, alpha) {
 
 // Convert a decimal codepoint to a Unicode U+XXXX codepoint
 const hexCp = (cp) => "U+" + cp.toString(16).toUpperCase().padStart(4, '0');
+
+// =============================================================================
+// Character tile cache
+//
+// Glyph rendering is the most expensive part of each frame, so instead of
+// drawing every visible character straight into the frame (like the old
+// renderCharacters() did), we render characters into small offscreen
+// "tile" canvases -- TILE_CELLS x TILE_CELLS codepoints each -- and cache
+// those tiles keyed by their grid position. The tile cache conceptually
+// spans the *entire* 256x256 BMP grid (65536 codepoints), far more than
+// what's ever on screen at once; only tiles that have actually been
+// requested get rendered and kept around, so panning back to a
+// previously-visited area is instant (no re-render needed).
+//
+// Each tile is rendered at one of a handful of resolution "buckets"
+// (pixels-per-codepoint-cell). When the current zoom level calls for a
+// higher-resolution bucket than what's cached, we queue a re-render of
+// that tile at the new resolution rather than blocking the current frame.
+// Until the higher-res version is ready, we keep compositing the old
+// (blurrier) tile, so zooming in shows a brief "sharpening" as fresh tiles
+// land, rather than either blocking or flashing to blank.
+// =============================================================================
+
+const TILE_CELLS = 8;                     // codepoints per tile edge (8x8 = 64 chars/tile)
+const TILE_COLS = GRID_COLS / TILE_CELLS; // 32
+const TILE_ROWS = GRID_ROWS / TILE_CELLS; // 32
+
+// Resolution buckets, in device pixels per grid cell. Rendering snaps up to
+// the nearest bucket so that small zoom changes don't constantly invalidate
+// tiles -- a tile stays "good enough" across a range of zoom levels before
+// it needs a re-render. The top bucket also caps how large tile canvases
+// (and thus memory) can get at extreme zoom.
+const QUALITY_BUCKETS = [16, 32, 64, 128, 256];
+
+function requiredCellPx(cellScreen) {
+  const target = cellScreen * devicePixelRatio;
+  for (const bucket of QUALITY_BUCKETS) {
+    if (bucket >= target) return bucket;
+  }
+  return QUALITY_BUCKETS[QUALITY_BUCKETS.length - 1];
+}
+
+const tileCache = new Map(); // "tr,tc" -> { canvas, cellPx, queued }
+const MAX_CACHED_TILES = 500; // soft memory cap; oldest-touched tiles are evicted first
+const renderQueue = [];
+let queueScheduled = false;
+
+function tileKey(tr, tc) {
+  return tr + "," + tc;
+}
+
+// Render one tile at the given resolution (cellPx = device pixels per cell)
+// into a fresh offscreen canvas, and store it in the cache.
+function renderTile(tr, tc, cellPx) {
+  const size = TILE_CELLS * cellPx;
+  const off = document.createElement("canvas");
+  off.width = size;
+  off.height = size;
+  const octx = off.getContext("2d");
+
+  // Character size scales directly off the resolution we're rendering at,
+  // with no upper cap -- this is what keeps glyph size consistent relative
+  // to the grid cell at every zoom level (the old fixed 40px cap made
+  // characters look tiny relative to their cell once zoomed in far).
+  const charSize = cellPx * 0.65;
+  octx.font = `${charSize}px ${FONT}`;
+  octx.textAlign = "center";
+  octx.textBaseline = "middle";
+
+  const rowBase = tr * TILE_CELLS;
+  const colBase = tc * TILE_CELLS;
+
+  for (let dr = 0; dr < TILE_CELLS; dr++) {
+    for (let dc = 0; dc < TILE_CELLS; dc++) {
+      const row = rowBase + dr;
+      const col = colBase + dc;
+      const cp = row * GRID_COLS + col;
+      if (cp > 0xFFFF) continue;
+
+      const bi = blockIndex[cp];
+      if (bi === 255) continue;
+      const blockName = BLOCKS[bi][2];
+      if (blockName.includes("Surrogate")) continue;
+
+      // Skip C0/C1 control characters
+      if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) continue;
+
+      try {
+        const char = String.fromCodePoint(cp);
+        octx.fillStyle = hexToRgba(blockColors[bi], 0.9);
+        octx.fillText(char, dc * cellPx + cellPx / 2, dr * cellPx + cellPx / 2);
+      } catch (e) {
+        // Skip invalid codepoints
+      }
+    }
+  }
+
+  tileCache.set(tileKey(tr, tc), { canvas: off, cellPx });
+  evictStaleTilesIfNeeded();
+}
+
+// Simple insertion-order-based LRU: touching a tile moves it to the end of
+// the Map, so the oldest untouched tiles end up at the front and get
+// evicted first once we're over the cap.
+function touchTile(key) {
+  const entry = tileCache.get(key);
+  if (entry) {
+    tileCache.delete(key);
+    tileCache.set(key, entry);
+  }
+}
+
+function evictStaleTilesIfNeeded() {
+  while (tileCache.size > MAX_CACHED_TILES) {
+    const oldestKey = tileCache.keys().next().value;
+    tileCache.delete(oldestKey);
+  }
+}
+
+// Make sure a tile is cached at >= the requested quality. If it's missing
+// or stale, queue a (re)render rather than rendering synchronously, so a
+// burst of newly-visible tiles (e.g. from a fast zoom) doesn't stall a frame.
+function ensureTile(tr, tc, cellPx) {
+  const key = tileKey(tr, tc);
+  const entry = tileCache.get(key);
+  if (entry && entry.cellPx >= cellPx) return;       // already good enough
+  if (entry && entry.queued >= cellPx) return;        // already queued at >= this quality
+
+  renderQueue.push({ tr, tc, cellPx });
+  if (entry) entry.queued = cellPx;
+  scheduleQueue();
+}
+
+function scheduleQueue() {
+  if (queueScheduled) return;
+  queueScheduled = true;
+  requestAnimationFrame(processQueue);
+}
+
+function processQueue() {
+  queueScheduled = false;
+  const BATCH_SIZE = 6; // render a few tiles per frame so panning/zooming stays smooth
+  let processed = 0;
+  while (renderQueue.length && processed < BATCH_SIZE) {
+    const { tr, tc, cellPx } = renderQueue.shift();
+    renderTile(tr, tc, cellPx);
+    processed++;
+  }
+  if (renderQueue.length) {
+    scheduleQueue();
+  }
+  // Newly-rendered tiles need to be composited even if the user has stopped
+  // panning/zooming (no pending d3 zoom event would otherwise trigger this).
+  drawCharOverlay();
+}
+
+// Composite all currently-visible tiles onto the char-canvas overlay at the
+// current transform, upgrading tile quality on demand via ensureTile().
+function drawCharOverlay() {
+  cctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  cctx.clearRect(0, 0, width, height);
+
+  const k = transform.k;
+  const cellScreen = CELL_SIZE * k;
+  if (cellScreen < LEVEL_CHARACTER) return; // not zoomed in enough to show glyphs at all
+
+  const tx = transform.x, ty = transform.y;
+  const calcx = (col) => col * CELL_SIZE * k + tx;
+  const calcy = (row) => row * CELL_SIZE * k + ty;
+
+  const worldLeft = -tx / k;
+  const worldTop = -ty / k;
+  const worldRight = (width - tx) / k;
+  const worldBottom = (height - ty) / k;
+
+  const colStart = Math.max(0, Math.floor(worldLeft / CELL_SIZE));
+  const colEnd = Math.min(GRID_COLS - 1, Math.ceil(worldRight / CELL_SIZE));
+  const rowStart = Math.max(0, Math.floor(worldTop / CELL_SIZE));
+  const rowEnd = Math.min(GRID_ROWS - 1, Math.ceil(worldBottom / CELL_SIZE));
+
+  const tileColStart = Math.max(0, Math.floor(colStart / TILE_CELLS));
+  const tileColEnd = Math.min(TILE_COLS - 1, Math.floor(colEnd / TILE_CELLS));
+  const tileRowStart = Math.max(0, Math.floor(rowStart / TILE_CELLS));
+  const tileRowEnd = Math.min(TILE_ROWS - 1, Math.floor(rowEnd / TILE_CELLS));
+
+  const desiredCellPx = requiredCellPx(cellScreen);
+
+  for (let tr = tileRowStart; tr <= tileRowEnd; tr++) {
+    for (let tc = tileColStart; tc <= tileColEnd; tc++) {
+      const key = tileKey(tr, tc);
+      ensureTile(tr, tc, desiredCellPx);
+
+      const entry = tileCache.get(key);
+      if (!entry) continue; // nothing rendered yet for this tile -- it'll appear once the queue catches up
+
+      touchTile(key);
+
+      const worldRow = tr * TILE_CELLS;
+      const worldCol = tc * TILE_CELLS;
+      const sx = calcx(worldCol);
+      const sy = calcy(worldRow);
+      const sSize = TILE_CELLS * CELL_SIZE * k;
+
+      cctx.drawImage(entry.canvas, sx, sy, sSize, sSize);
+    }
+  }
+}
 
 // =============================================================================
 // Rendering with semantic zoom
@@ -484,7 +719,7 @@ function render() {
 
   renderBlockOutline(cellScreen >= LEVEL_BLOCK_LABELS);
 
-  // --- LEVEL 3: Individual character grid and characters ---
+  // --- LEVEL 3: Individual character grid ---
   function renderCharGrid() {
     // Draw grid lines
     ctx.strokeStyle = "rgba(255,255,255,0.08)";
@@ -507,55 +742,6 @@ function render() {
     renderCharGrid();
   }
 
-  // --- Draw individual characters when zoomed in enough ---
-  function renderCharacters() {
-    const charSize = Math.min(cellScreen * 0.65, 40);
-    ctx.font = `${charSize}px ${FONT}`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = "#fff";
-
-    // Limit how many chars we render for performance
-    const maxChars = 10000;
-    let charCount = 0;
-
-    for (let row = rowStart; row <= rowEnd && charCount < maxChars; row++) {
-      for (let col = colStart; col <= colEnd && charCount < maxChars; col++) {
-        const cp = row * GRID_COLS + col;
-        if (cp > 0xFFFF) continue;
-
-        // Skip control characters, surrogates, private use at very high density
-        const bi = blockIndex[cp];
-        if (bi === 255) continue;
-        const blockName = BLOCKS[bi][2];
-        if (blockName.includes("Surrogate")) continue;
-
-        // Skip C0/C1 control characters
-        if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) continue;
-
-        const cx = calcx(col + 0.5);
-        const cy = calcy(row + 0.5);
-
-        // Only render if on screen
-        if (cx < -cellScreen || cx > width + cellScreen || cy < -cellScreen || cy > height + cellScreen) continue;
-
-        try {
-          const char = String.fromCodePoint(cp);
-          ctx.fillStyle = hexToRgba(blockColors[bi], 0.9);
-          ctx.fillText(char, cx, cy);
-        } catch(e) {
-          // Skip invalid codepoints
-          console.log(`Invalid codepoint: ${cp}`, e)
-        }
-        charCount++;
-      }
-    }
-  }
-
-  if (cellScreen >= LEVEL_CHARACTER) {
-    renderCharacters();
-  }
-
   // --- Draw hex row/col indicators ---
   function renderHexRowColIndicators() {
     const indicatorSize = Math.max(8, Math.min(11, cellScreen * 0.5));
@@ -576,6 +762,10 @@ function render() {
   renderHexRowColIndicators();
 
   ctx.restore();
+
+  // Individual unicode glyphs are drawn on the separate overlay canvas,
+  // composited from the tile cache (see "Character tile cache" above).
+  drawCharOverlay();
 }
 
 // =============================================================================
