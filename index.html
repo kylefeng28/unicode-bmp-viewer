@@ -115,6 +115,7 @@
   <div><span class="label">View: </span><span class="value" id="view-mode">Block Overview</span></div>
   <div><span class="label">Category: </span><span class="value" id="hover-category">—</span></div>
   <div><span class="label">Block: </span><span class="value" id="hover-block">—</span></div>
+  <div><span class="label">Block Range: </span><span class="value" id="hover-block-range">—</span></div>
 </div>
 
 <div id="legend"></div>
@@ -300,6 +301,10 @@ function hexToRgba(hex, alpha) {
   const b = parseInt(hex.slice(5, 7), 16);
   return `rgba(${r},${g},${b},${alpha})`;
 }
+
+
+// Convert a decimal codepoint to a Unicode U+XXXX codepoint
+const hexCp = (cp) => "U+" + cp.toString(16).toUpperCase().padStart(4, '0');
 
 // =============================================================================
 // Rendering with semantic zoom
@@ -585,9 +590,23 @@ canvas.addEventListener("mousemove", (e) => {
 });
 
 canvas.addEventListener("mouseleave", () => {
-  document.getElementById("tooltip").style.display = "none";
-  document.getElementById("hover-block").textContent = "—";
+  hideTooltip();
+  clearHover();
 });
+
+function hideTooltip() {
+  document.getElementById("tooltip").style.display = "none";
+}
+
+function updateHoverText(blockName, category, blockRange) {
+  document.getElementById("hover-block").textContent = blockName;
+  document.getElementById("hover-category").textContent = category;
+  document.getElementById("hover-block-range").textContent = blockRange;
+}
+
+function clearHover() {
+  updateHoverText("-", "-", "-")
+}
 
 function updateHover(px, py) {
   // Convert screen to world
@@ -597,18 +616,19 @@ function updateHover(px, py) {
   const row = Math.floor(worldY / CELL_SIZE);
 
   if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) {
-    document.getElementById("tooltip").style.display = "none";
-    document.getElementById("hover-block").textContent = "—";
-    document.getElementById("hover-category").textContent = "—";
+    hideTooltip();
+    clearHover();
     return;
   }
 
   const cp = row * GRID_COLS + col;
   const bi = blockIndex[cp];
-  const blockName = bi < 255 ? BLOCKS[bi][2] : "No Block";
+  const block = bi < 255 ? BLOCKS[bi] : null;
+  const blockName = bi < 255 ? block[2] : "No Block";
   const category = bi < 255 ? blockCategories[bi] : "—";
-  document.getElementById("hover-block").textContent = blockName;
-  document.getElementById("hover-category").textContent = category;
+
+  const blockRange = bi < 255 ? `${hexCp(block[0])}-${hexCp(block[1])}` : "—";
+  updateHoverText(blockName, category, blockRange)
 
   updateTooltip(px, py, cp, blockName);
 }
@@ -623,7 +643,7 @@ function updateTooltip(px, py, cp, blockName) {
     return;
   }
 
-  const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+  const hex = hexCp(cp);
   let char = "";
   try { char = String.fromCodePoint(cp); } catch(e) {}
 
